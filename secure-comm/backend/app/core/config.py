@@ -109,7 +109,7 @@ class Settings(BaseSettings):
     @computed_field
     @property
     def ALLOWED_HOSTS(self) -> List[str]:
-        defaults = ["localhost", "127.0.0.1"]
+        defaults = ["localhost", "127.0.0.1", "*.onrender.com", "*.vercel.app", "*"]
         return parse_env_list(self.CORS_HOSTS, defaults)
     
     @computed_field

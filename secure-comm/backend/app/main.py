@@ -549,7 +549,7 @@ async def serve_upload(
     )
 
 
-@app.get("/", tags=["Status"])
+@app.api_route("/", methods=["GET", "HEAD"], tags=["Status"])
 async def root():
     """API root - status check"""
     return {
