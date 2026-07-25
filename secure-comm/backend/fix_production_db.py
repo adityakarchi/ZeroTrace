@@ -1,12 +1,58 @@
 """
 Fix production PostgreSQL database schema.
 Run this on Render or any PostgreSQL deployment.
+
+NOTE: This script is no longer called during normal startup.
+The app lifespan (main.py) now handles table creation via
+Base.metadata.create_all(). This script is kept as a standalone
+utility for manual schema fixes.
+
+It is safe to run on an empty database — tables will be created first.
 """
 import os
 import sys
 import secrets
 from sqlalchemy import create_engine, text, inspect
 from sqlalchemy.orm import sessionmaker
+
+# Add project root to path so imports work when run standalone
+sys.path.insert(0, os.path.dirname(__file__))
+
+def ensure_tables_exist(engine):
+    """Create all tables if they don't exist (idempotent).
+    
+    This MUST run before any schema fix functions to ensure
+    base tables like 'users' exist before dependent tables
+    reference them with foreign keys.
+    """
+    print("\n=== Ensuring all tables exist ===")
+    try:
+        from app.db.database import Base
+        # Import all model modules so SQLAlchemy knows about all tables
+        from app.db import friend_models       # noqa: F401
+        from app.db import secure_profile_models  # noqa: F401
+        from app.db import device_sync_models     # noqa: F401
+        
+        inspector = inspect(engine)
+        tables_before = set(inspector.get_table_names())
+        
+        Base.metadata.create_all(bind=engine)
+        
+        inspector = inspect(engine)
+        tables_after = set(inspector.get_table_names())
+        new_tables = tables_after - tables_before
+        
+        if new_tables:
+            print(f"✅ Created {len(new_tables)} new tables: {sorted(new_tables)}")
+        else:
+            print(f"✅ All {len(tables_after)} tables already exist")
+        
+        return len(tables_before) == 0  # True if fresh DB
+    except Exception as e:
+        print(f"❌ Error creating tables: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
 
 def fix_users_table(engine):
     """Add missing columns to users table."""
@@ -310,10 +356,13 @@ if __name__ == "__main__":
         print(f"Connecting to database...")
         engine = create_engine(database_url)
         
-        # Fix users table
+        # CRITICAL: Create all tables first (prevents FK reference errors)
+        ensure_tables_exist(engine)
+        
+        # Fix users table (add any missing columns)
         fix_users_table(engine)
         
-        # Fix friend_requests table
+        # Fix friend_requests table (migrate old schema if needed)
         fix_friend_requests_schema(engine)
         
         print("\n" + "="*60)

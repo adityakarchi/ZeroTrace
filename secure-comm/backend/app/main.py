@@ -231,20 +231,61 @@ async def prune_profile_history():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifecycle events"""
+    """Application lifecycle events — handles fresh and existing databases."""
     # Startup
     logger.info("🚀 Starting ZeroTrace API...")
     logger.info(f"🔧 Environment: {settings.ENVIRONMENT}")
     logger.info(f"🗄️  Database: {settings.DATABASE_URL.split('://')[0]}")
     
-    # Run database migration for PostgreSQL
-    if settings.is_postgres:
-        logger.info("🔄 Running database migration for PostgreSQL...")
+    # ── Step 1: Test database connectivity ──
+    try:
+        from sqlalchemy import text
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        logger.info("✅ Database connected successfully")
+    except Exception as e:
+        logger.error(f"❌ Database connection failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise  # Fatal — can't start without a database
+    
+    # ── Step 2: Create all tables (idempotent — skips existing) ──
+    # This MUST run before any migration/fix scripts.
+    # SQLAlchemy resolves FK dependency order automatically, so
+    # `users` is created before `friend_requests`, etc.
+    try:
+        from sqlalchemy import inspect as sa_inspect
+        inspector = sa_inspect(engine)
+        tables_before = set(inspector.get_table_names())
+        
+        Base.metadata.create_all(bind=engine)
+        
+        inspector = sa_inspect(engine)
+        tables_after = set(inspector.get_table_names())
+        new_tables = tables_after - tables_before
+        
+        if new_tables:
+            logger.info(f"📊 Created {len(new_tables)} new tables: {sorted(new_tables)}")
+        else:
+            logger.info(f"📊 All {len(tables_after)} tables already exist — no changes needed")
+        
+        is_fresh_db = len(tables_before) == 0
+    except Exception as e:
+        logger.error(f"❌ Table creation failed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise  # Fatal — tables must exist
+    
+    # ── Step 3: Run schema migrations for PostgreSQL (add missing columns) ──
+    # Only needed when tables already existed (i.e., upgrading an older schema).
+    # On a fresh DB, create_all() already created everything correctly.
+    if settings.is_postgres and not is_fresh_db:
+        logger.info("🔄 Running schema migrations for existing PostgreSQL tables...")
         try:
-            from sqlalchemy import text, inspect
+            from sqlalchemy import text, inspect as sa_inspect
             
             with engine.connect() as conn:
-                inspector = inspect(engine)
+                inspector = sa_inspect(engine)
                 tables = inspector.get_table_names()
                 
                 # ---- Migrate users table: add missing columns ----
@@ -277,10 +318,9 @@ async def lifespan(app: FastAPI):
                         logger.info("✅ Users table schema up to date")
                 
                 # ---- Migrate friend_requests table ----
-                # Check if friend_requests table needs migration
+                # Check if friend_requests table has old schema columns
                 if 'friend_requests' in tables:
                     columns = {col['name']: col for col in inspector.get_columns('friend_requests')}
-                    logger.info(f"📋 Current friend_requests columns: {list(columns.keys())}")
                     
                     # If table has old schema columns (from_user_id, to_user_id), drop and recreate
                     has_old_columns = 'from_user_id' in columns or 'to_user_id' in columns
@@ -289,18 +329,19 @@ async def lifespan(app: FastAPI):
                         logger.info("⚠️ Found old schema columns (from_user_id/to_user_id) - dropping table...")
                         conn.execute(text("DROP TABLE IF EXISTS friend_requests CASCADE"))
                         conn.commit()
-                        logger.info("✅ Dropped old friend_requests table - will be recreated with correct schema")
-                else:
-                    logger.info("📝 friend_requests table will be created fresh")
-                    
+                        # Recreate with correct schema from SQLAlchemy models
+                        Base.metadata.tables['friend_requests'].create(bind=engine, checkfirst=True)
+                        logger.info("✅ Recreated friend_requests table with correct schema")
+                    else:
+                        logger.info("✅ friend_requests schema up to date")
+                        
+            logger.info("✅ Schema migrations completed")
         except Exception as e:
-            logger.error(f"❌ Migration error: {e}")
+            logger.error(f"⚠️ Migration error (non-fatal): {e}")
             import traceback
             traceback.print_exc()
-    
-    # Create database tables
-    Base.metadata.create_all(bind=engine)
-    logger.info("📊 Database tables created/verified")
+    elif settings.is_postgres and is_fresh_db:
+        logger.info("✅ Fresh database — all tables created with correct schema, no migrations needed")
     
     # Create demo user if CREATE_DEMO_USER is set (for testing only)
     import os
